@@ -1,10 +1,15 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_event.h"
 #include "esp_system.h"
 #include "esp_spi_flash.h"
+#include "nvs_flash.h"
 
 #include "driver/spi.h"
 #include "driver/gpio.h"
+
+#include "wifi.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -143,14 +148,34 @@ static void update_display(bitmap_t *fb)
 	spi_trans(HSPI_HOST, &trans);
 }
 
+static void gpio_irq_handler_wps_pb(void *arg)
+{
+	SemaphoreHandle_t *wps_pb_sema = arg;
+	xSemaphoreGiveFromISR(wps_pb_sema, pdFALSE);
+}
+
+static uint8_t fb_data[32];
+static bitmap_t fb = {
+		.w = 16, .h = 16,
+		.data = fb_data,
+};
+
+static void got_ip_event_handler(void* arg, esp_event_base_t event_base,
+		int32_t event_id, void* event_data)
+{
+	ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+	uint32_t ip = ntohl(event->ip_info.ip.addr) & 0xff;
+	printf("got ip: %s", ip4addr_ntoa(&event->ip_info.ip));
+
+	draw_char(&fb, 0, 0, '0' + ((ip / 100) % 10));
+	draw_char(&fb, 4, 0, '0' + ((ip / 10) % 10));
+	draw_char(&fb, 8, 0, '0' + ((ip / 1) % 10));
+}
+
 void app_main()
 {
+	SemaphoreHandle_t *wps_pb_sema;
 	int i = 0;
-	uint8_t fb_data[32];
-	bitmap_t fb = {
-			.w = 16, .h = 16,
-			.data = fb_data,
-	};
 
 	spi_config_t spi_config = {
 			.interface.val = SPI_DEFAULT_INTERFACE,
@@ -168,15 +193,36 @@ void app_main()
 			.intr_type = GPIO_INTR_DISABLE,
 	};
 
+	gpio_config_t gpio_irq_config = {
+			.pin_bit_mask = GPIO_Pin_2,
+			.mode = GPIO_MODE_INPUT,
+			.pull_up_en = GPIO_PULLUP_ENABLE,
+			.pull_down_en = GPIO_PULLDOWN_DISABLE,
+			.intr_type = GPIO_INTR_NEGEDGE,
+	};
+
 	/* set initial level of GPIOs */
 	gpio_set_level(GPIO_NUM_12, 0);	/* output enable */
 	gpio_set_level(GPIO_NUM_15, 1); /* latch */
 
 	gpio_config(&gpio_output_config);
+	gpio_config(&gpio_irq_config);
+
+	wps_pb_sema = xSemaphoreCreateBinary();
+	gpio_install_isr_service(0);
+	gpio_isr_handler_add(GPIO_NUM_2, gpio_irq_handler_wps_pb, wps_pb_sema);
 
 	spi_config.interface.miso_en = 0;
 	spi_config.interface.cs_en = 0;
 	spi_init(HSPI_HOST, &spi_config);
+
+	nvs_flash_init();
+
+	tcpip_adapter_init();
+	esp_event_loop_create_default();
+	ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &got_ip_event_handler, NULL));
+
+	wifi_init();
 
 	memset(fb_data, 0, sizeof(fb_data));
 
@@ -191,6 +237,11 @@ void app_main()
 	draw_char(&fb, 12, 5, 'l');
 
 	for (;;) {
+		if (xSemaphoreTake(wps_pb_sema, 0) == pdTRUE) {
+			printf("WPS push button pressed\n");
+			wifi_start_wps();
+		}
+
 		/* second test: show a counter */
 		draw_char(&fb, 0, 11, '0' + (i / 1000) % 10);
 		draw_char(&fb, 4, 11, '0' + ((i / 100) % 10));
